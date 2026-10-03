@@ -45,6 +45,7 @@ int logger_open(Logger *logger, const char *log_path)
         return -1;
     }
     logger->file = NULL;
+    pthread_mutex_init(&logger->lock, NULL);
 
     if (log_path == NULL) {
         return -1;
@@ -72,14 +73,26 @@ void logger_printf(Logger *logger, const char *format, ...)
     va_end(args);
 
     FILE *log_file = (logger != NULL) ? (FILE *)logger->file : NULL;
+
+    // Una sola región crítica para que archivo y stderr salgan sin entrelazarse
+    if (logger != NULL) {
+        pthread_mutex_lock(&logger->lock);
+    }
     write_line(log_file, timestamp, message);
     write_line(stderr, timestamp, message);
+    if (logger != NULL) {
+        pthread_mutex_unlock(&logger->lock);
+    }
 }
 
 void logger_close(Logger *logger)
 {
-    if (logger != NULL && logger->file != NULL) {
+    if (logger == NULL) {
+        return;
+    }
+    if (logger->file != NULL) {
         fclose((FILE *)logger->file);
         logger->file = NULL;
     }
+    pthread_mutex_destroy(&logger->lock);
 }

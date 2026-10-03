@@ -4,8 +4,8 @@
 #include "msgstream.h"
 #include "net.h"
 #include "protocol.h"
-
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +16,14 @@
 
 #define SERVER_TCP_BACKLOG 16
 #define SERVER_RECV_BUFFER 4096
+
+// Argumentos que recibe cada hilo de cliente, el propio hilo libera esta estructura
+typedef struct {
+    NodeRegistry *registry;
+    Logger *logger;
+    int client_fd;
+    char peer_text[NET_PEER_TEXT_MAX_LEN];
+} ClientThreadArgs;
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -168,7 +176,16 @@ static void serve_tcp_client(NodeRegistry *registry, int client_fd,
     net_close(client_fd);
 }
 
-// Acepta un cliente TCP, registra su IP:puerto y lo atiende hasta que cierre
+// Punto de entrada del hilo de cliente, este atiende la conexión y libera sus propios recursos
+static void *client_thread_main(void *raw_args)
+{
+    ClientThreadArgs *args = (ClientThreadArgs *)raw_args;
+    serve_tcp_client(args->registry, args->client_fd, args->peer_text, args->logger);
+    free(args); // el hilo detached libera lo que recibió
+    return NULL;
+}
+
+// Acepta un cliente TCP y lanza un hilo independiente que lo atiende sin bloquear al principal
 static void accept_and_serve_client(NodeRegistry *registry, int tcp_listener,
                                     Logger *logger)
 {
@@ -185,15 +202,30 @@ static void accept_and_serve_client(NodeRegistry *registry, int tcp_listener,
         return;
     }
 
-    char peer_text[NET_PEER_TEXT_MAX_LEN];
+    ClientThreadArgs *args = malloc(sizeof(*args));
+    if (args == NULL) {
+        logger_printf(logger, "error: sin memoria para atender un nuevo cliente");
+        net_close(client_fd);
+        return;
+    }
+    args->registry = registry;
+    args->logger = logger;
+    args->client_fd = client_fd;
     if (net_format_peer((struct sockaddr *)&client_address,
                         client_address_len,
-                        peer_text, sizeof(peer_text)) != 0) {
-        snprintf(peer_text, sizeof(peer_text), "cliente-no-identificable");
+                        args->peer_text, sizeof(args->peer_text)) != 0) {
+        snprintf(args->peer_text, sizeof(args->peer_text), "cliente-no-identificable");
     }
-    logger_printf(logger, "conexión TCP aceptada desde %s", peer_text);
+    logger_printf(logger, "conexión TCP aceptada desde %s", args->peer_text);
 
-    serve_tcp_client(registry, client_fd, peer_text, logger);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, client_thread_main, args) != 0) {
+        logger_printf(logger, "error: no se pudo crear el hilo para %s", args->peer_text);
+        net_close(client_fd);
+        free(args);
+        return;
+    }
+    pthread_detach(thread);
 }
 
 // Recibe UDP con cada datagrama como mensaje y lo entrega al parser
@@ -301,9 +333,12 @@ int main(int argc, char **argv)
         }
     }
 
+    // Al parar se cierran los sockets de escucha para no aceptar más conexiones,
+    // los hilos de cliente se separan, terminan por su cuenta y liberan lo suyo
     logger_printf(&logger, "servidor MMP deteniéndose; cerrando recursos");
     net_close(tcp_listener);
     net_close(udp_socket);
-    logger_close(&logger);
+    // No se destruyen registry ni logger aquí para no liberar un mutex que un hilo
+    // separado podría estar usando. Es el OS el que libera al terminar el proceso
     return EXIT_SUCCESS;
 }

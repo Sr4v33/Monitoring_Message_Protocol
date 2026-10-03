@@ -9,7 +9,17 @@ void registry_init(NodeRegistry *registry)
     if (registry == NULL) {
         return;
     }
-    memset(registry, 0, sizeof(*registry));
+    // Se limpian solo las entradas de nodos, el mutex se inicializa aparte
+    memset(registry->nodes, 0, sizeof(registry->nodes));
+    pthread_mutex_init(&registry->lock, NULL);
+}
+
+void registry_destroy(NodeRegistry *registry)
+{
+    if (registry == NULL) {
+        return;
+    }
+    pthread_mutex_destroy(&registry->lock);
 }
 
 // Busca un nodo por su id y devuelve la entrada o NULL si no está registrado
@@ -254,16 +264,9 @@ DispatchOutcome mmp_dispatch(NodeRegistry *registry,
         return outcome;
     }
 
-    switch (request->type) {
-    case MMP_TYPE_REGISTER:
-        return handle_register(registry, request, out_response);
-    case MMP_TYPE_STATUS:
-        return handle_status(registry, request, out_response);
-    case MMP_TYPE_EVENT:
-        return handle_event(registry, request, out_response);
-    case MMP_TYPE_QUERY:
-        return handle_query(registry, request, out_response);
-    default:
+    // El caso default no toca el estado compartido, así que no necesita el mutex
+    if (request->type != MMP_TYPE_REGISTER && request->type != MMP_TYPE_STATUS &&
+        request->type != MMP_TYPE_EVENT && request->type != MMP_TYPE_QUERY) {
         // Tipos que el servidor no procesa como entrada (ACKs, RESPONSE, ERROR o desconocido),
         // solo se responde con ERROR si llegó por TCP, donde el emisor espera correlación
         if (origin_is_tcp) {
@@ -274,4 +277,25 @@ DispatchOutcome mmp_dispatch(NodeRegistry *registry,
         }
         return outcome;
     }
+
+    // Región crítica mínima, los handlers leen y escriben el registro compartido
+    pthread_mutex_lock(&registry->lock);
+    switch (request->type) {
+    case MMP_TYPE_REGISTER:
+        outcome = handle_register(registry, request, out_response);
+        break;
+    case MMP_TYPE_STATUS:
+        outcome = handle_status(registry, request, out_response);
+        break;
+    case MMP_TYPE_EVENT:
+        outcome = handle_event(registry, request, out_response);
+        break;
+    case MMP_TYPE_QUERY:
+        outcome = handle_query(registry, request, out_response);
+        break;
+    default:
+        break;
+    }
+    pthread_mutex_unlock(&registry->lock);
+    return outcome;
 }

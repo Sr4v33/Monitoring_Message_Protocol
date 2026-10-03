@@ -1,7 +1,7 @@
 // Flujos MMP, registro de nodos y despacho de mensajes a su handler
 #ifndef MMP_HANDLERS_H
 #define MMP_HANDLERS_H
-
+#include <pthread.h>
 #include "protocol.h"
 
 // Máximo de nodos registrados simultáneamente
@@ -25,15 +25,19 @@ typedef struct {
     int history_next; // índice circular de escritura
 } NodeEntry;
 
-// Registro central de nodos
+// Registro central de nodos, el mutex protege su acceso concurrente desde varios hilos
 typedef struct {
     NodeEntry nodes[REGISTRY_MAX_NODES];
+    pthread_mutex_t lock;
 } NodeRegistry;
 
-// Inicialización del registro vacío
+// Inicialización del registro vacío y de su mutex
 void registry_init(NodeRegistry *registry);
 
-// Resultado del despacho: indica si debe enviarse una respuesta y por qué transporte lógico.
+// Libera los recursos del registro (mutex), se llama al terminar el servidor
+void registry_destroy(NodeRegistry *registry);
+
+// Resultado del despacho, que indica si debe enviarse una respuesta y por medio de qué transporte lógico
 typedef struct {
     int has_response; // es 1 si out_response quedó listo para enviar
     int response_is_error; // es 1 si la respuesta es un mensaje ERROR
