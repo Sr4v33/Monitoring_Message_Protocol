@@ -116,6 +116,23 @@ int net_format_peer(const struct sockaddr *address, socklen_t address_len,
     return 0;
 }
 
+int net_send_all(int socket_fd, const char *data, size_t length)
+{
+    size_t sent = 0;
+    // send puede escribir menos de lo pedido
+    while (sent < length) {
+        ssize_t n = send(socket_fd, data + sent, length - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue; // si es interrumpido por señal, se reintenta
+            }
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
 void net_close(int socket_fd)
 {
     if (socket_fd >= 0) {

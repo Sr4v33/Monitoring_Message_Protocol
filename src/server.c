@@ -1,5 +1,6 @@
 // Arranque del servidor MMP y recepción de mensajes TCP (flujo) y UDP (datagrama).
 #include "log.h"
+#include "mmp_handlers.h"
 #include "msgstream.h"
 #include "net.h"
 #include "protocol.h"
@@ -34,31 +35,94 @@ static void install_signal_handlers(void)
     sigaction(SIGTERM, &action, NULL);
 }
 
-// Interpretación de una línea ya delimitada con el parser del protocolo
-static void parse_and_log(const char *line, const char *origin, Logger *logger)
+// Envía una respuesta de MMP por TCP, por lo que serializa, agrega el delimitador '\n' y la transmite
+static void send_tcp_response(int client_fd, const MmpMessage *response,
+                              const char *origin, Logger *logger)
 {
-    MmpMessage message;
-    MmpParseResult result = mmp_parse(line, &message);
-
-    switch (result) {
-    case MMP_PARSE_OK:
-        logger_printf(logger, "%s mensaje válido tipo %s id=%s",
-                      origin, mmp_type_to_string(message.type), message.id);
-        mmp_message_free(&message);
-        break;
-    case MMP_PARSE_INVALID_FORMAT:
-        logger_printf(logger, "%s mensaje rechazado: formato inválido (no es JSON)", origin);
-        break;
-    case MMP_PARSE_INVALID_PARAMETER:
-        logger_printf(logger, "%s mensaje rechazado: parámetro inválido", origin);
-        break;
-    case MMP_PARSE_UNKNOWN_MESSAGE:
-        logger_printf(logger, "%s mensaje rechazado: tipo desconocido", origin);
-        break;
+    char *json_text = mmp_serialize(response);
+    if (json_text == NULL) {
+        logger_printf(logger, "%s error: no se pudo serializar la respuesta", origin);
+        return;
     }
+
+    // El delimitador TCP del protocolo es '\n' y sse añade al enviar
+    size_t json_length = strlen(json_text);
+    char *framed = malloc(json_length + 2);
+    if (framed == NULL) {
+        free(json_text);
+        logger_printf(logger, "%s error: sin memoria al preparar la respuesta", origin);
+        return;
+    }
+    memcpy(framed, json_text, json_length);
+    framed[json_length] = '\n';
+    framed[json_length + 1] = '\0';
+
+    if (net_send_all(client_fd, framed, json_length + 1) != 0) {
+        logger_printf(logger, "%s error: fallo al enviar la respuesta", origin);
+    } else {
+        logger_printf(logger, "%s respuesta enviada tipo %s id=%s",
+                      origin, mmp_type_to_string(response->type), response->id);
+    }
+
+    free(framed);
+    free(json_text);
 }
 
-static void serve_tcp_client(int client_fd, const char *peer_text, Logger *logger)
+// Para procesar una línea, parsea, despacha el flujo y responde por TCP cuando corresponde
+// tcp_client_fd < 0 indica origen UDP (sin respuesta por conexión)
+static void process_message(NodeRegistry *registry, const char *line,
+                            const char *origin, Logger *logger,
+                            int tcp_client_fd)
+{
+    MmpMessage request;
+    MmpParseResult result = mmp_parse(line, &request);
+
+    // Los errores del parser se registran y en TCP, se devuelve un ERROR controlado
+    if (result != MMP_PARSE_OK) {
+        const char *code = (result == MMP_PARSE_INVALID_FORMAT) ? "INVALID_FORMAT"
+                         : (result == MMP_PARSE_UNKNOWN_MESSAGE) ? "UNKNOWN_MESSAGE"
+                         : "INVALID_PARAMETER";
+        logger_printf(logger, "%s mensaje rechazado: %s", origin, code);
+        if (tcp_client_fd >= 0) {
+            // Se arma un ERROR mínimo reutilizando el protocolo, porque el id puede ir vacío si no se parseó
+            MmpMessage error_response;
+            mmp_message_init(&error_response);
+            error_response.type = MMP_TYPE_ERROR;
+            error_response.payload = cJSON_CreateObject();
+            if (error_response.payload != NULL) {
+                cJSON_AddStringToObject(error_response.payload, "code", code);
+            }
+            send_tcp_response(tcp_client_fd, &error_response, origin, logger);
+            mmp_message_free(&error_response);
+        }
+        return;
+    }
+
+    logger_printf(logger, "%s mensaje válido tipo %s id=%s",
+                  origin, mmp_type_to_string(request.type), request.id);
+
+    MmpMessage response;
+    DispatchOutcome outcome = mmp_dispatch(registry, &request,
+                                           tcp_client_fd >= 0, &response);
+
+    if (outcome.has_response) {
+        if (tcp_client_fd >= 0) {
+            logger_printf(logger, "%s flujo %s -> respuesta %s",
+                          origin, mmp_type_to_string(request.type),
+                          mmp_type_to_string(response.type));
+            send_tcp_response(tcp_client_fd, &response, origin, logger);
+        }
+        mmp_message_free(&response);
+    } else {
+        logger_printf(logger, "%s flujo %s procesado sin respuesta",
+                      origin, mmp_type_to_string(request.type));
+    }
+
+    mmp_message_free(&request);
+}
+
+static void serve_tcp_client(NodeRegistry *registry, int client_fd,
+                             const char *peer_text, Logger *logger)
 {
     MsgStream stream;
     msgstream_init(&stream);
@@ -70,7 +134,7 @@ static void serve_tcp_client(int client_fd, const char *peer_text, Logger *logge
     while (!stop_requested) {
         ssize_t received = recv(client_fd, recv_buffer, sizeof(recv_buffer), 0);
         if (received == 0) {
-            // Cierre ordenado del cliente: fin normal de la conexión.
+            // Cierre ordenado del cliente: fin normal de la conexión
             logger_printf(logger, "conexión TCP cerrada por %s", peer_text);
             break;
         }
@@ -96,7 +160,7 @@ static void serve_tcp_client(int client_fd, const char *peer_text, Logger *logge
         const char *line = NULL;
         size_t line_length = 0;
         while (msgstream_next(&stream, &line, &line_length)) {
-            parse_and_log(line, origin, logger);
+            process_message(registry, line, origin, logger, client_fd);
         }
     }
 
@@ -105,7 +169,8 @@ static void serve_tcp_client(int client_fd, const char *peer_text, Logger *logge
 }
 
 // Acepta un cliente TCP, registra su IP:puerto y lo atiende hasta que cierre
-static void accept_and_serve_client(int tcp_listener, Logger *logger)
+static void accept_and_serve_client(NodeRegistry *registry, int tcp_listener,
+                                    Logger *logger)
 {
     struct sockaddr_storage client_address;
     socklen_t client_address_len = sizeof(client_address);
@@ -128,11 +193,12 @@ static void accept_and_serve_client(int tcp_listener, Logger *logger)
     }
     logger_printf(logger, "conexión TCP aceptada desde %s", peer_text);
 
-    serve_tcp_client(client_fd, peer_text, logger);
+    serve_tcp_client(registry, client_fd, peer_text, logger);
 }
 
 // Recibe UDP con cada datagrama como mensaje y lo entrega al parser
-static void receive_udp_datagram(int udp_socket, Logger *logger)
+static void receive_udp_datagram(NodeRegistry *registry, int udp_socket,
+                                 Logger *logger)
 {
     char datagram[SERVER_RECV_BUFFER];
     struct sockaddr_storage source_address;
@@ -158,7 +224,8 @@ static void receive_udp_datagram(int udp_socket, Logger *logger)
         snprintf(origin, sizeof(origin), "UDP origen-no-identificable");
     }
 
-    parse_and_log(datagram, origin, logger);
+    // UDP no mantiene conexión de respuesta, por eso se pasa -1 como client_fd
+    process_message(registry, datagram, origin, logger, -1);
 }
 
 int main(int argc, char **argv)
@@ -203,6 +270,10 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    // Registro de nodos compartido por todos los flujos
+    NodeRegistry registry;
+    registry_init(&registry);
+
     logger_printf(&logger,
                   "servidor MMP iniciado: TCP y UDP escuchando en el puerto %s", port);
 
@@ -223,10 +294,10 @@ int main(int argc, char **argv)
         }
 
         if (FD_ISSET(udp_socket, &read_set)) {
-            receive_udp_datagram(udp_socket, &logger);
+            receive_udp_datagram(&registry, udp_socket, &logger);
         }
         if (FD_ISSET(tcp_listener, &read_set)) {
-            accept_and_serve_client(tcp_listener, &logger);
+            accept_and_serve_client(&registry, tcp_listener, &logger);
         }
     }
 

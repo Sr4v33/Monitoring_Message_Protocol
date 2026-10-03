@@ -20,6 +20,10 @@ int net_create_udp_socket(const char *host, const char *port);
 int net_format_peer(const struct sockaddr *address, socklen_t address_len,
                     char *out_text, size_t out_text_size);
 
+// Envía todos los bytes del buffer por un socket TCP, reintentando ante envíos parciales
+// Retorna 0 si se enviaron todos, -1 si falló
+int net_send_all(int socket_fd, const char *data, size_t length);
+
 // Cierra el socket si es mayor o igual a 0 (válido)
 void net_close(int socket_fd);
 
