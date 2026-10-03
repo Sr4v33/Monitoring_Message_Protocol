@@ -33,14 +33,26 @@ static void handle_stop_signal(int signal_number)
     stop_requested = 1;
 }
 
-// Señal de cierre
-static void install_signal_handlers(void)
+// Configura cierre en el hilo principal e ignora SIGPIPE en respuestas TCP.
+static int install_signal_handlers(void)
 {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_stop_signal;
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(SIGINT, &action, NULL) != 0 ||
+        sigaction(SIGTERM, &action, NULL) != 0) {
+        return -1;
+    }
+
+    struct sigaction ignore_action;
+    memset(&ignore_action, 0, sizeof(ignore_action));
+    ignore_action.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignore_action.sa_mask) != 0 ||
+        sigaction(SIGPIPE, &ignore_action, NULL) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 // Envía una respuesta de MMP por TCP, por lo que serializa, agrega el delimitador '\n' y la transmite
@@ -96,6 +108,7 @@ static void process_message(NodeRegistry *registry, const char *line,
             MmpMessage error_response;
             mmp_message_init(&error_response);
             error_response.type = MMP_TYPE_ERROR;
+            snprintf(error_response.id, sizeof(error_response.id), "%s", request.id);
             error_response.payload = cJSON_CreateObject();
             if (error_response.payload != NULL) {
                 cJSON_AddStringToObject(error_response.payload, "code", code);
@@ -103,6 +116,7 @@ static void process_message(NodeRegistry *registry, const char *line,
             send_tcp_response(tcp_client_fd, &error_response, origin, logger);
             mmp_message_free(&error_response);
         }
+        mmp_message_free(&request);
         return;
     }
 
@@ -139,7 +153,7 @@ static void serve_tcp_client(NodeRegistry *registry, int client_fd,
     char origin[128];
     snprintf(origin, sizeof(origin), "TCP %s", peer_text);
 
-    while (!stop_requested) {
+    while (1) {
         ssize_t received = recv(client_fd, recv_buffer, sizeof(recv_buffer), 0);
         if (received == 0) {
             // Cierre ordenado del cliente: fin normal de la conexión
@@ -148,7 +162,7 @@ static void serve_tcp_client(NodeRegistry *registry, int client_fd,
         }
         if (received < 0) {
             if (errno == EINTR) {
-                continue; // interrumpido por señal: reintentar o salir según stop_requested
+                continue;
             }
             logger_printf(logger, "error: recv falló en %s", peer_text);
             break;
@@ -218,14 +232,33 @@ static void accept_and_serve_client(NodeRegistry *registry, int tcp_listener,
     }
     logger_printf(logger, "conexión TCP aceptada desde %s", args->peer_text);
 
+    sigset_t stop_signals;
+    sigset_t previous_mask;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &stop_signals, &previous_mask) != 0) {
+        logger_printf(logger, "error: no se pudo bloquear señales para %s", args->peer_text);
+        net_close(client_fd);
+        free(args);
+        return;
+    }
+
     pthread_t thread;
-    if (pthread_create(&thread, NULL, client_thread_main, args) != 0) {
+    int create_status = pthread_create(&thread, NULL, client_thread_main, args);
+    int restore_status = pthread_sigmask(SIG_SETMASK, &previous_mask, NULL);
+    if (create_status != 0) {
         logger_printf(logger, "error: no se pudo crear el hilo para %s", args->peer_text);
         net_close(client_fd);
         free(args);
         return;
     }
-    pthread_detach(thread);
+    if (restore_status != 0) {
+        logger_printf(logger, "error: no se pudo restaurar la máscara de señales");
+    }
+    if (pthread_detach(thread) != 0) {
+        logger_printf(logger, "aviso: no se pudo separar un hilo de cliente");
+    }
 }
 
 // Recibe UDP con cada datagrama como mensaje y lo entrega al parser
@@ -283,7 +316,24 @@ int main(int argc, char **argv)
                 log_path);
     }
 
-    install_signal_handlers();
+    if (install_signal_handlers() != 0) {
+        logger_printf(&logger, "error: no se pudieron configurar las señales");
+        logger_close(&logger);
+        return EXIT_FAILURE;
+    }
+
+    sigset_t stop_signals;
+    sigset_t pselect_mask;
+    if (sigemptyset(&stop_signals) != 0 ||
+        sigaddset(&stop_signals, SIGINT) != 0 ||
+        sigaddset(&stop_signals, SIGTERM) != 0 ||
+        pthread_sigmask(SIG_BLOCK, &stop_signals, &pselect_mask) != 0 ||
+        sigdelset(&pselect_mask, SIGINT) != 0 ||
+        sigdelset(&pselect_mask, SIGTERM) != 0) {
+        logger_printf(&logger, "error: no se pudo configurar la espera de señales");
+        logger_close(&logger);
+        return EXIT_FAILURE;
+    }
 
     // Socket TCP de escucha
     int tcp_listener = net_create_tcp_listener(host, port, SERVER_TCP_BACKLOG);
@@ -316,12 +366,13 @@ int main(int argc, char **argv)
         FD_SET(tcp_listener, &read_set);
         FD_SET(udp_socket, &read_set);
 
-        int ready = select(max_fd + 1, &read_set, NULL, NULL, NULL);
+        int ready = pselect(max_fd + 1, &read_set, NULL, NULL, NULL,
+                            &pselect_mask);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            logger_printf(&logger, "error: select falló");
+            logger_printf(&logger, "error: pselect falló");
             break;
         }
 

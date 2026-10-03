@@ -77,9 +77,6 @@ static int copy_bounded_field(char *destination, size_t destination_size,
 {
     size_t length = strlen(source);
     if (length >= destination_size) {
-        length = destination_size - 1;
-        memcpy(destination, source, length);
-        destination[length] = '\0';
         return 0;
     }
     memcpy(destination, source, length + 1);
@@ -184,28 +181,26 @@ MmpParseResult mmp_parse(const char *json_buffer, MmpMessage *out_message)
         return MMP_PARSE_INVALID_FORMAT;
     }
 
-    // El "type" que es requerido si está ausente o es inválido es INVALID_PARAMETER,
-    // si no es reconocido, es UNKNOWN_MESSAGE
+    // El "type" y el "id" son campos requeridos
+    MmpParseResult result =
+        read_required_string(root, "id", out_message->id, sizeof(out_message->id));
+    if (result != MMP_PARSE_OK) {
+        cJSON_Delete(root);
+        return result;
+    }
+
     const cJSON *type_field = cJSON_GetObjectItemCaseSensitive(root, "type");
     if (!cJSON_IsString(type_field) || type_field->valuestring == NULL) {
         cJSON_Delete(root);
         return MMP_PARSE_INVALID_PARAMETER;
     }
+
     MmpMessageType parsed_type = mmp_type_from_string(type_field->valuestring);
     if (parsed_type == MMP_TYPE_UNKNOWN) {
         cJSON_Delete(root);
         return MMP_PARSE_UNKNOWN_MESSAGE;
     }
     out_message->type = parsed_type;
-
-    // El "id" requerido que relaciona las solicitudes y las respuestas
-    MmpParseResult result =
-        read_required_string(root, "id", out_message->id, sizeof(out_message->id));
-    if (result != MMP_PARSE_OK) {
-        mmp_message_free(out_message);
-        cJSON_Delete(root);
-        return result;
-    }
 
     // La versión "v" que es opcional, pero por defecto la versión del protocolo
     const cJSON *version_field = cJSON_GetObjectItemCaseSensitive(root, "v");
@@ -214,7 +209,6 @@ MmpParseResult mmp_parse(const char *json_buffer, MmpMessage *out_message)
     } else if (cJSON_IsNumber(version_field)) {
         out_message->version = version_field->valueint;
     } else {
-        mmp_message_free(out_message);
         cJSON_Delete(root);
         return MMP_PARSE_INVALID_PARAMETER;
     }
@@ -222,7 +216,6 @@ MmpParseResult mmp_parse(const char *json_buffer, MmpMessage *out_message)
     result = read_optional_string(root, "node_id", out_message->node_id,
                                   sizeof(out_message->node_id));
     if (result != MMP_PARSE_OK) {
-        mmp_message_free(out_message);
         cJSON_Delete(root);
         return result;
     }
@@ -230,7 +223,6 @@ MmpParseResult mmp_parse(const char *json_buffer, MmpMessage *out_message)
     result = read_optional_string(root, "ts", out_message->timestamp,
                                   sizeof(out_message->timestamp));
     if (result != MMP_PARSE_OK) {
-        mmp_message_free(out_message);
         cJSON_Delete(root);
         return result;
     }
@@ -239,13 +231,11 @@ MmpParseResult mmp_parse(const char *json_buffer, MmpMessage *out_message)
     const cJSON *payload_field = cJSON_GetObjectItemCaseSensitive(root, "payload");
     if (payload_field != NULL) {
         if (!cJSON_IsObject(payload_field)) {
-            mmp_message_free(out_message);
             cJSON_Delete(root);
             return MMP_PARSE_INVALID_PARAMETER;
         }
         out_message->payload = cJSON_Duplicate(payload_field, 1);
         if (out_message->payload == NULL) {
-            mmp_message_free(out_message);
             cJSON_Delete(root);
             return MMP_PARSE_INVALID_PARAMETER;
         }

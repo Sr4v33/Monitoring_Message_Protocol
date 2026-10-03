@@ -128,6 +128,9 @@ int net_send_all(int socket_fd, const char *data, size_t length)
             }
             return -1;
         }
+        if (n == 0) {
+            return -1;
+        }
         sent += (size_t)n;
     }
     return 0;

@@ -1,4 +1,4 @@
-// Implementación de los flujos REGISTER/STATUS/EVENT/QUERY/ERRO
+// Implementación de los flujos REGISTER/STATUS/EVENT/QUERY/ERROR
 #include "mmp_handlers.h"
 
 #include <stdio.h>
@@ -85,10 +85,14 @@ static DispatchOutcome handle_register(NodeRegistry *registry,
         return outcome;
     }
 
-    NodeEntry *entry = registry_find(registry, request->node_id);
-    if (entry == NULL) {
-        entry = registry_add(registry, request->node_id);
+    if (registry_find(registry, request->node_id) != NULL) {
+        build_error(response, request, "NODE_ALREADY_REGISTERED",
+                    "el nodo ya está registrado");
+        outcome.response_is_error = 1;
+        return outcome;
     }
+
+    NodeEntry *entry = registry_add(registry, request->node_id);
     if (entry == NULL) {
         build_error(response, request, "INTERNAL_ERROR", "registro de nodos lleno");
         outcome.response_is_error = 1;
@@ -147,7 +151,18 @@ static DispatchOutcome handle_status(NodeRegistry *registry,
     return outcome;
 }
 
-// el EVENT requiere de un nodo registrado, y responde EVENT_ACK con el mismo id
+static int event_payload_is_valid(const cJSON *payload)
+{
+    if (payload == NULL) {
+        return 0;
+    }
+    const cJSON *event_type = cJSON_GetObjectItemCaseSensitive(payload, "event_type");
+    const cJSON *severity = cJSON_GetObjectItemCaseSensitive(payload, "severity");
+    const cJSON *description = cJSON_GetObjectItemCaseSensitive(payload, "description");
+    return cJSON_IsString(event_type) && cJSON_IsString(severity) &&
+           cJSON_IsString(description);
+}
+
 static DispatchOutcome handle_event(NodeRegistry *registry,
                                     const MmpMessage *request,
                                     MmpMessage *response)
@@ -164,8 +179,13 @@ static DispatchOutcome handle_event(NodeRegistry *registry,
         outcome.response_is_error = 1;
         return outcome;
     }
+    if (!event_payload_is_valid(request->payload)) {
+        build_error(response, request, "INVALID_PARAMETER", "payload inválido en EVENT");
+        outcome.response_is_error = 1;
+        return outcome;
+    }
 
-    // se da EVENT_ACK con el mismo id del EVENT para que el nodo lo correlacione
+    // Se da EVENT_ACK con el mismo id del EVENT para que el nodo lo correlacione
     init_response(response, MMP_TYPE_EVENT_ACK, request);
     response->payload = cJSON_CreateObject();
     if (response->payload != NULL) {
@@ -182,15 +202,11 @@ static cJSON *build_history_array(const NodeEntry *entry, int limit)
         return NULL;
     }
 
-    // Recorre el histórico del más antiguo al más reciente respetando el buffer
     int count = entry->history_count;
-    int start = (entry->history_count == REGISTRY_HISTORY_PER_NODE)
-                    ? entry->history_next : 0;
-    int emitted = 0;
-    for (int i = 0; i < count; i++) {
-        if (limit > 0 && emitted >= limit) {
-            break;
-        }
+    int emitted_count = (limit > 0 && limit < count) ? limit : count;
+    int oldest = (count == REGISTRY_HISTORY_PER_NODE) ? entry->history_next : 0;
+    int start = (oldest + count - emitted_count) % REGISTRY_HISTORY_PER_NODE;
+    for (int i = 0; i < emitted_count; i++) {
         const StatusRecord *record =
             &entry->history[(start + i) % REGISTRY_HISTORY_PER_NODE];
         cJSON *item = cJSON_CreateObject();
@@ -202,7 +218,6 @@ static cJSON *build_history_array(const NodeEntry *entry, int limit)
             cJSON_AddNumberToObject(item, "cpu_usage", record->cpu_usage);
         }
         cJSON_AddItemToArray(records, item);
-        emitted++;
     }
     return records;
 }
@@ -220,19 +235,26 @@ static DispatchOutcome handle_query(NodeRegistry *registry,
         return outcome;
     }
 
-    // Lee el limit del payload, que debe ser mayor que cero si existe
+    const cJSON *query_type = request->payload != NULL
+        ? cJSON_GetObjectItemCaseSensitive(request->payload, "query_type") : NULL;
+    if (!cJSON_IsString(query_type) || query_type->valuestring == NULL ||
+        strcmp(query_type->valuestring, "HISTORICAL") != 0) {
+        build_error(response, request, "INVALID_PARAMETER",
+                    "query_type debe ser HISTORICAL");
+        outcome.response_is_error = 1;
+        return outcome;
+    }
+
     int limit = 0;
-    if (request->payload != NULL) {
-        const cJSON *limit_field =
-            cJSON_GetObjectItemCaseSensitive(request->payload, "limit");
-        if (limit_field != NULL) {
-            if (!cJSON_IsNumber(limit_field) || limit_field->valueint <= 0) {
-                build_error(response, request, "INVALID_PARAMETER", "limit debe ser mayor que cero");
-                outcome.response_is_error = 1;
-                return outcome;
-            }
-            limit = limit_field->valueint;
+    const cJSON *limit_field =
+        cJSON_GetObjectItemCaseSensitive(request->payload, "limit");
+    if (limit_field != NULL) {
+        if (!cJSON_IsNumber(limit_field) || limit_field->valueint <= 0) {
+            build_error(response, request, "INVALID_PARAMETER", "limit debe ser mayor que cero");
+            outcome.response_is_error = 1;
+            return outcome;
         }
+        limit = limit_field->valueint;
     }
 
     NodeEntry *entry = registry_find(registry, request->node_id);
@@ -264,7 +286,17 @@ DispatchOutcome mmp_dispatch(NodeRegistry *registry,
         return outcome;
     }
 
-    // El caso default no toca el estado compartido, así que no necesita el mutex
+    if (origin_is_tcp && request->type == MMP_TYPE_STATUS) {
+        build_error(out_response, request, "INVALID_PARAMETER",
+                    "STATUS requiere transporte UDP");
+        outcome.has_response = 1;
+        outcome.response_is_error = 1;
+        return outcome;
+    }
+    if (!origin_is_tcp && request->type != MMP_TYPE_STATUS) {
+        return outcome;
+    }
+
     if (request->type != MMP_TYPE_REGISTER && request->type != MMP_TYPE_STATUS &&
         request->type != MMP_TYPE_EVENT && request->type != MMP_TYPE_QUERY) {
         // Tipos que el servidor no procesa como entrada (ACKs, RESPONSE, ERROR o desconocido),

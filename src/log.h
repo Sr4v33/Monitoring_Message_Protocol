@@ -8,6 +8,7 @@
 typedef struct {
     void *file; // FILE* del archivo de log
     pthread_mutex_t lock;
+    int lock_initialized;
 } Logger;
 
 // Abre el log en modo "añadir", 0 si éxito, -1 si no abre

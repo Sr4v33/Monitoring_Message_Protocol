@@ -11,15 +11,12 @@ static void format_timestamp(char *buffer, size_t buffer_size)
     time_t now = time(NULL);
     struct tm local_time;
 
-    // Se usa localtime
-    struct tm *result = localtime(&now);
-    if (result == NULL) {
+    if (localtime_r(&now, &local_time) == NULL) {
         if (buffer_size > 0) {
             buffer[0] = '\0';
         }
         return;
     }
-    local_time = *result;
 
     if (strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", &local_time) == 0) {
         if (buffer_size > 0) {
@@ -45,7 +42,11 @@ int logger_open(Logger *logger, const char *log_path)
         return -1;
     }
     logger->file = NULL;
-    pthread_mutex_init(&logger->lock, NULL);
+    logger->lock_initialized = 0;
+    if (pthread_mutex_init(&logger->lock, NULL) != 0) {
+        return -1;
+    }
+    logger->lock_initialized = 1;
 
     if (log_path == NULL) {
         return -1;
@@ -74,13 +75,12 @@ void logger_printf(Logger *logger, const char *format, ...)
 
     FILE *log_file = (logger != NULL) ? (FILE *)logger->file : NULL;
 
-    // Una sola región crítica para que archivo y stderr salgan sin entrelazarse
-    if (logger != NULL) {
+    if (logger != NULL && logger->lock_initialized) {
         pthread_mutex_lock(&logger->lock);
     }
     write_line(log_file, timestamp, message);
     write_line(stderr, timestamp, message);
-    if (logger != NULL) {
+    if (logger != NULL && logger->lock_initialized) {
         pthread_mutex_unlock(&logger->lock);
     }
 }
@@ -94,5 +94,8 @@ void logger_close(Logger *logger)
         fclose((FILE *)logger->file);
         logger->file = NULL;
     }
-    pthread_mutex_destroy(&logger->lock);
+    if (logger->lock_initialized) {
+        pthread_mutex_destroy(&logger->lock);
+        logger->lock_initialized = 0;
+    }
 }

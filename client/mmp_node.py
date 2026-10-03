@@ -100,10 +100,10 @@ class MmpNode:
         logger.info("STATUS enviado por UDP id=%s cpu_usage=%s", message["id"], cpu_usage)
 
     def send_event(self, event_type, severity, description):
-        """Envía un EVENT por TCP y procesa el EVENT_ACK o el ERROR de respuesta"""
+        """Envía un EVENT por TCP y devuelve si recibió su EVENT_ACK correlacionado"""
         if not self.state.can("SEND_EVENT"):
             logger.warning("EVENT no permitido en el estado %s", self.state.state)
-            return
+            return False
         message = proto.build_message(
             proto.TYPE_EVENT, self._next_id(), node_id=self.node_id,
             timestamp=_now_iso(),
@@ -113,39 +113,43 @@ class MmpNode:
         self._tcp.send_message(message)
         self._transition("SEND_EVENT")  # REGISTERED -> WAITING_EVENT_ACK
         logger.info("EVENT enviado id=%s tipo=%s", message["id"], event_type)
-        self._await_event_ack(message["id"])
+        return self._await_event_ack(message["id"])
 
     def _await_event_ack(self, event_id):
-        """Espera el EVENT_ACK correlacionado por id, o procesa un ERROR del servidor"""
+        """Espera el EVENT_ACK correlacionado y devuelve si fue válido"""
         raw = self._tcp.receive_message()
         if raw is None:
             logger.error("servidor desconectado mientras se esperaba EVENT_ACK")
             self._transition("DISCONNECT")
-            return
+            return False
 
         result, response = proto.parse(raw)
         if result != proto.PARSE_OK:
             logger.error("respuesta ilegible al EVENT (%s)", result)
-            return
+            return False
 
         if response["type"] == proto.TYPE_EVENT_ACK:
-            if response.get("id") == event_id:
-                logger.info("EVENT_ACK recibido para id=%s", event_id)
-            else:
+            if response.get("id") != event_id:
                 logger.warning("EVENT_ACK con id distinto: %s", response.get("id"))
+                return False
+            logger.info("EVENT_ACK recibido para id=%s", event_id)
             self._transition("EVENT_ACK")  # vuelve a REGISTERED
-        elif response["type"] == proto.TYPE_ERROR:
+            return True
+        if response["type"] == proto.TYPE_ERROR:
             # Un ERROR del servidor no debe terminar el proceso, por lo que se registra y se vuelve a REGISTERED
             logger.error("ERROR al enviar EVENT: %s", response.get("payload", {}).get("code"))
             self._transition("EVENT_ACK")
-        else:
-            logger.warning("respuesta inesperada al EVENT: tipo %s", response["type"])
+            return False
+        logger.warning("respuesta inesperada al EVENT: tipo %s", response["type"])
+        return False
 
     def close(self):
         """Cierra la conexión TCP del nodo de forma ordenada"""
         if self._tcp is not None:
             self._tcp.close()
             self._tcp = None
+        if self.state.can("DISCONNECT"):
+            self._transition("DISCONNECT")
         logger.info("nodo detenido")
 
 
@@ -171,7 +175,9 @@ def main(argv=None):
         if not node.register():
             return 1
         node.send_status(args.cpu_usage)
-        node.send_event("HIGH_TEMPERATURE", "CRITICAL", "temperatura sobre el umbral")
+        if not node.send_event("HIGH_TEMPERATURE", "CRITICAL",
+                               "temperatura sobre el umbral"):
+            return 1
     except (ConnectionError, OSError) as error:
         logger.error("fallo de comunicación: %s", error)
         return 1
